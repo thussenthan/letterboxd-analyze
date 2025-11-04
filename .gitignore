@@ -1,0 +1,19 @@
+# Bytecode and caches
+__pycache__/
+
+# Virtual environments
+.venv/
+
+# macOS cruft
+.DS_Store
+
+# Analysis output (regenerateable)
+# Ignore everything in artifacts/ but keep artifacts/scatter.png tracked
+artifacts/*
+!artifacts/scatter.png
+
+# Local letterboxd export directories
+letterboxd-*-utc/
+
+# Local HTTP cache written by the enrichment script
+.letterboxd_cache.json

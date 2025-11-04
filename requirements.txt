@@ -1,0 +1,6 @@
+beautifulsoup4>=4.12
+matplotlib>=3.7
+numpy>=1.26
+pandas>=2.2
+requests>=2.31
+tqdm>=4.66
