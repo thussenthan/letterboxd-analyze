@@ -2,9 +2,11 @@
 """Command-line utility for validating Letterboxd export files.
 
 The script checks for:
-1. Rating mismatches for the same film across ratings and reviews exports.
+1. Rating mismatches for the same film across diary, ratings, and reviews exports.
 2. Duplicate film entries in the reviews export that use different ratings.
-3. Deleted diary/review entries that are missing from their corresponding primary exports.
+3. Duplicate diary entries on the same date for the same film.
+4. Deleted diary/review entries that are missing from their corresponding primary exports.
+5. Reports a final success message when all checks pass.
 """
 
 from __future__ import annotations
@@ -58,6 +60,151 @@ def find_missing_deleted_entries(deleted: pd.DataFrame, primary: pd.DataFrame) -
     )
 
 
+def _normalise_rating(value) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+        return numeric / 2.0 if numeric > 5 else numeric
+    except ValueError:
+        pass
+    stars = text.count("★")
+    half = 0.5 if ("½" in text or ".5" in text) else 0.0
+    rating = stars + half
+    if rating == 0 and text.count("☆"):
+        return 0.0
+    return min(max(rating, 0.0), 5.0)
+
+
+def _coerce_rewatch_flag(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip().str.lower().eq("yes")
+
+
+def _build_film_key(df: pd.DataFrame) -> pd.Series:
+    uri = df.get("Letterboxd URI")
+    if uri is None:
+        uri = pd.Series([""] * len(df), index=df.index)
+    uri = uri.fillna("").astype(str).str.strip()
+
+    name = df.get("Name")
+    if name is None:
+        name = pd.Series([""] * len(df), index=df.index)
+    name = name.fillna("").astype(str).str.strip()
+
+    year = df.get("Year")
+    if year is None:
+        year = pd.Series([""] * len(df), index=df.index)
+    year = year.fillna("").astype(str).str.strip()
+
+    fallback = name + " (" + year + ")"
+    return uri.where(uri != "", fallback)
+
+
+def _build_sort_date(df: pd.DataFrame) -> pd.Series:
+    watched = pd.to_datetime(df.get("Watched Date"), errors="coerce")
+    logged = pd.to_datetime(df.get("Date"), errors="coerce")
+    if watched is None:
+        return logged
+    if logged is None:
+        return watched
+    return watched.fillna(logged)
+
+
+def find_rewatch_diary_anomalies(diary: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    diary = diary.copy()
+    diary["film_key"] = _build_film_key(diary)
+    diary["sort_date"] = _build_sort_date(diary)
+    diary["rewatch_flag"] = _coerce_rewatch_flag(diary.get("Rewatch", pd.Series(index=diary.index)))
+
+    diary = diary.sort_values(["film_key", "sort_date", "Date"])
+    diary["watch_index"] = diary.groupby("film_key", dropna=False).cumcount()
+
+    first_entries = diary[diary["watch_index"] == 0]
+    first_rewatch = first_entries[first_entries["rewatch_flag"]]
+
+    later_entries = diary[diary["watch_index"] > 0]
+    later_not_rewatch = later_entries[~later_entries["rewatch_flag"]]
+
+    cols = ["Name", "Year", "Letterboxd URI", "Date", "Watched Date", "Rewatch"]
+    first_rewatch = first_rewatch[[c for c in cols if c in first_rewatch.columns]].sort_values(["Name", "Year"])
+    later_not_rewatch = later_not_rewatch[[c for c in cols if c in later_not_rewatch.columns]].sort_values(
+        ["Name", "Year", "Date"]
+    )
+
+    return first_rewatch.reset_index(drop=True), later_not_rewatch.reset_index(drop=True)
+
+
+def find_duplicate_diary_entries_same_date(diary: pd.DataFrame) -> pd.DataFrame:
+    diary = diary.copy()
+    diary["film_key"] = _build_film_key(diary)
+    diary["sort_date"] = _build_sort_date(diary)
+    dup_mask = diary.duplicated(subset=["film_key", "sort_date"], keep=False)
+    duplicates = diary[dup_mask]
+    cols = ["Name", "Year", "Letterboxd URI", "Date", "Watched Date", "Rewatch", "Rating", "sort_date"]
+    duplicates = duplicates[[c for c in cols if c in duplicates.columns]].sort_values(["Name", "Year", "sort_date"])
+    if "sort_date" in duplicates.columns:
+        duplicates = duplicates.drop(columns=["sort_date"])
+    return duplicates.reset_index(drop=True)
+
+
+
+
+def find_rating_mismatches_across_sources(
+    sources: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    info_map: dict[str, dict[str, str]] = {}
+    rating_sets: dict[str, dict[str, list[float]]] = {}
+
+    for label, df in sources.items():
+        df = df.copy()
+        df["film_key"] = _build_film_key(df)
+        df["rating_norm"] = df["Rating"].map(_normalise_rating)
+        info = (
+            df[["film_key", "Name", "Year", "Letterboxd URI"]]
+            .drop_duplicates(subset=["film_key"])
+            .set_index("film_key")
+        )
+        info_map.update(info.fillna("").astype(str).to_dict(orient="index"))
+        rating_sets[label] = (
+            df.groupby("film_key", dropna=False)["rating_norm"]
+            .apply(lambda s: sorted({v for v in s if v is not None}))
+            .to_dict()
+        )
+
+    all_keys = set().union(*[set(m.keys()) for m in rating_sets.values()])
+    records: list[dict[str, str]] = []
+    for key in sorted(all_keys):
+        per_source = {}
+        union: set[float] = set()
+        source_internal_mismatch = False
+        for label, mapping in rating_sets.items():
+            values = mapping.get(key, [])
+            if len(values) > 1:
+                source_internal_mismatch = True
+            union.update(values)
+            per_source[label] = ", ".join(str(v) for v in values) if values else ""
+
+        if len(union) <= 1 and not source_internal_mismatch:
+            continue
+
+        info = info_map.get(key, {})
+        record = {
+            "Name": info.get("Name", ""),
+            "Year": info.get("Year", ""),
+            "Letterboxd URI": info.get("Letterboxd URI", ""),
+        }
+        for label in sources:
+            record[label] = per_source.get(label, "")
+        records.append(record)
+
+    if not records:
+        return pd.DataFrame(columns=["Name", "Year", "Letterboxd URI", *sources.keys()])
+    return pd.DataFrame(records).sort_values(["Name", "Year"], na_position="last")
+
+
 def run_checks(
     reviews_path: Path,
     ratings_path: Path,
@@ -80,7 +227,7 @@ def run_checks(
     diary: Optional[pd.DataFrame] = None
     if diary_path.exists():
         diary = load_csv(diary_path, "diary export")
-        validate_columns(diary, {"Name"}, "diary export")
+        validate_columns(diary, {"Name", "Rewatch", "Rating"}, "diary export")
     elif require_diary:
         raise SystemExit(f"diary export not found at {diary_path}")
 
@@ -99,27 +246,50 @@ def run_checks(
         raise SystemExit(f"deleted diary export not found at {deleted_diary_path}")
 
     mismatches = find_rating_mismatches(reviews, ratings)
+    rating_mismatches = find_rating_mismatches_across_sources(
+        {
+            "ratings.csv": ratings,
+            "reviews.csv": reviews,
+            "diary.csv": diary if diary is not None else pd.DataFrame(columns=["Name", "Year", "Letterboxd URI", "Rating"]),
+        }
+    )
     dup_reviews = find_duplicate_reviews(reviews)
+    all_good = True
 
     print(f"== Rating mismatches between {ratings_path} and {reviews_path} ==")
     if mismatches.empty:
-        print("No rating mismatches found.")
+        print("✅ No rating mismatches found.")
     else:
+        print("❌ Rating mismatches found.")
         print(mismatches.to_string(index=False))
+        all_good = False
+
+    print("\n== Rating mismatches across ratings/reviews/diary ==")
+    if rating_mismatches.empty:
+        print("✅ No cross-export rating mismatches found.")
+    else:
+        print("❌ Cross-export rating mismatches found.")
+        print(rating_mismatches.to_string(index=False))
+        all_good = False
 
     print(f"\n== Duplicate Names in {reviews_path} with differing Ratings ==")
     if dup_reviews.empty:
-        print("No Names in reviews have multiple different Ratings.")
+        print("✅ No Names in reviews have multiple different Ratings.")
     else:
+        print("❌ Duplicate Names with differing Ratings found.")
         print(dup_reviews.to_string(index=False))
+        all_good = False
+
 
     if deleted_reviews is not None:
         missing_deleted_reviews = find_missing_deleted_entries(deleted_reviews, reviews)
         print(f"\n== Deleted reviews entries missing from {reviews_path} ==")
         if missing_deleted_reviews.empty:
-            print("All deleted reviews are present in the primary reviews export.")
+            print("✅ All deleted reviews are present in the primary reviews export.")
         else:
+            print("❌ Missing deleted reviews entries found.")
             print(missing_deleted_reviews.to_string(index=False))
+            all_good = False
     elif deleted_reviews_path != Path("deleted/reviews.csv"):
         print(f"\nSkipped deleted reviews check; file not found at {deleted_reviews_path}.")
 
@@ -131,12 +301,36 @@ def run_checks(
         missing_deleted_diary = find_missing_deleted_entries(deleted_diary, diary)
         print(f"\n== Deleted diary entries missing from {diary_path} ==")
         if missing_deleted_diary.empty:
-            print("All deleted diary entries are present in the primary diary export.")
+            print("✅ All deleted diary entries are present in the primary diary export.")
         else:
+            print("❌ Missing deleted diary entries found.")
             print(missing_deleted_diary.to_string(index=False))
+            all_good = False
     elif require_deleted_diary or deleted_diary_path != Path("deleted/diary.csv"):
         # Provide feedback when an explicit deleted diary path was inferred but absent.
         print(f"\nSkipped deleted diary check; file not found at {deleted_diary_path}.")
+
+    if diary is not None:
+        _, later_not_rewatch = find_rewatch_diary_anomalies(diary)
+        duplicate_diary_entries = find_duplicate_diary_entries_same_date(diary)
+        print(f"\n== Diary entries after the first watch that are not marked as rewatches ({diary_path}) ==")
+        if later_not_rewatch.empty:
+            print("✅ All subsequent diary entries are marked as rewatches.")
+        else:
+            print("❌ Subsequent diary entries not marked as rewatches found.")
+            print(later_not_rewatch.to_string(index=False))
+            all_good = False
+
+        print(f"\n== Duplicate diary entries on the same date for the same film ({diary_path}) ==")
+        if duplicate_diary_entries.empty:
+            print("✅ No duplicate diary entries on the same date.")
+        else:
+            print("❌ Duplicate diary entries on the same date found.")
+            print(duplicate_diary_entries.to_string(index=False))
+            all_good = False
+
+    if all_good:
+        print("\n✅🎉 All checks passed. Your exports look clean.")
 
 
 def parse_args() -> argparse.Namespace:

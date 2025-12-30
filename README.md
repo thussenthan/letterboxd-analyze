@@ -4,6 +4,14 @@ Utilities for inspecting your Letterboxd export locally. The scripts stay lightw
 
 ## Features
 
+- Validate rating consistency across diary, ratings, and reviews exports.
+- Detect duplicate review ratings for the same film.
+- Detect duplicate diary entries on the same date for the same film.
+- Verify deleted diary/review entries still exist in the primary exports.
+- Check that all diary entries after the first watch are marked as rewatches.
+- Print a final success line when all checks pass.
+- Enrich ratings with public averages and generate comparison plots.
+
 ## Getting Started
 
 1. **Python**: Install Python 3.11 or newer.
@@ -19,6 +27,12 @@ Utilities for inspecting your Letterboxd export locally. The scripts stay lightw
 
    ```bash
    pip install -r requirements.txt
+   ```
+
+   If you use uv:
+
+   ```bash
+   uv pip install -r requirements.txt
    ```
 
 ## Prepare Your Data
@@ -44,6 +58,9 @@ By default the script will search for `ratings.csv` inside the most recent `lett
 
 The script generates:
 
+- `artifacts/scatter.png` – your rating vs the public weighted average
+- `artifacts/residuals_top.png` – largest absolute residuals
+
 Key options:
 
 Run `python compare_letterboxd.py --help` to see the full CLI.
@@ -56,11 +73,12 @@ python validate_exports.py
 
 By default this will search for `reviews.csv`, `ratings.csv`, `diary.csv`, and the `deleted/*.csv` exports inside the most recent `letterboxd-*-utc/` archive, falling back to files in the current directory if none are found. Use `--reviews`, `--ratings`, `--diary`, `--deleted-reviews`, or `--deleted-diary` to point at specific paths.
 
-This reports rating mismatches, duplicate review ratings, and deleted diary/review entries that are missing from their corresponding primary exports.
+This reports rating mismatches across diary/ratings/reviews, duplicate review ratings, duplicate diary entries on the same date, deleted diary/review entries missing from primary exports, diary rewatch consistency, and a final success line when all checks pass.
 
 ## Repository Layout
 
-- `artifacts/residuals_top.csv` – detailed view of the largest residuals when the enrichment script runs.
+- `artifacts/scatter.png` – scatter plot output from the comparison script.
+- `artifacts/residuals_top.png` – residual plot output from the comparison script.
 
 ## Friendly Scraping Notice
 
